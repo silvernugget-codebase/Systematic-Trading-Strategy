@@ -25,7 +25,7 @@ Out of sample, the strategy underperformed all three benchmarks measured by risk
 
 ```r
 install.packages(
-    c(
+  c(
     "quantmod",
     "PortfolioAnalytics",
     "PerformanceAnalytics",
@@ -36,6 +36,7 @@ install.packages(
     "kableExtra"
   )
 )
+
 rmarkdown::render("STT.Rmd")
 
 ```
