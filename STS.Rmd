@@ -1,0 +1,536 @@
+---
+title: "Systematic Trading Strategy"
+subtitle: "A Bet Against The Market"
+author: "Bischoy Bert"
+date: "2026-04-19"
+output: 
+  pdf_document:
+    number_sections: true
+    toc: true
+    toc_depth: 3
+linestretch: 1.25
+geometry: margin=1.25in
+---
+
+\newpage
+
+# Introduction
+
+The aim of this paper is to define a systematic trading strategy, that is, a rules-based, non-discretionary investment strategy designed to navigate a highly specific macroeconomic regime: **Stagflation**. That is, a macroeconomic environment characterized by weak growth and persistent inflation. The strategy is built on the hypothesis that this regime is becoming increasingly likely. With leading indicators increasingly pointing toward a global recession, geopolitical uncertainty and concerns surrounding the USD hegemony amid efforts by the BRICS nations to replace the USD as the world reserve currency with a new, gold-backed alternative, for instance, the vulnerability of momentum equities and traditional market-cap-weighted portfolios has seldom been higher. The assumptions of prolonged peace and zero-interest-rate policies that have strongly driven speculative investments are no longer guaranteed to hold or be as effective as they have been in overcoming crises.
+
+The proposed strategy aims to force a significant portion of capital into a basket of hard assets, commodities, and inflation hedges, while still allowing for an active allocation into a globally diversified mix of equities and fixed-income instruments. The objective is to employ an optimization framework maximizing risk-adjusted returns subject to the outlined economic intuition.
+
+# Instruments
+
+To construct this strategy, a universe of 40 highly liquid Exchange-Traded Funds (ETFs) was assembled. For the sake of simplicity, all funds are traded in the US. The assets are broadly categorized as follows:
+
+-   **US Equities & Sectors**
+-   **International Equities**
+-   **Fixed Income**
+-   **Commodities & Real Estate**
+
+A detailed overview of all assets can be found at the end of this paper.
+
+# Data
+
+The historical market data for the selected universe was fetched using the `quantmod`-package to extract daily adjusted closing prices for each instrument. The time horizon spans from January 1, 2008 to April 17, 2026, offering a sufficiently large timeframe to split our data into an *In-Sample* (IS) training period and *Out of Sample* (OOS) testing period.
+
+## Data Preparation
+
+```{r Data Preparation, message=FALSE, warning=FALSE}
+library(quantmod)
+library(PortfolioAnalytics)
+library(PerformanceAnalytics)
+library(ROI)
+library(ROI.plugin.glpk)
+library(ROI.plugin.quadprog)
+library(knitr)
+library(kableExtra)
+
+symbols <- c(
+  "SPY", "QQQ", "IWM", "MDY", "XLF", "XLK", "XLV", "XLE", "XLP", "XLI", "XLB", 
+  "XLU", "XLY", "EFA", "EEM", "VGK", "EWJ", "FXI", "EWZ", "EWY", "EWG", "EWC",
+  "AGG", "TLT", "IEF", "SHY", "LQD", "HYG", "EMB", "TIP", "BIL", "GLD", "SLV", 
+  "DBC", "DBA", "USO", "XME", "GDX", "VNQ", "RWX"
+)
+
+rets <- list()
+for(i in 1:length(symbols)) {
+  # print(i)
+  x_i <- getSymbols(symbols[i], to = "2026-04-17", auto.assign = FALSE)
+  returns <- Return.calculate(x_i[,6])
+  colnames(returns) <- symbols[i]
+  rets[[i]] <- returns
+}
+
+returns_all <- do.call(merge, rets)
+```
+
+## NA Handling
+
+Following, we make sure there is no missing data and that we have enough coverage (i.e. minimum 15 years) for all assets.
+
+```{r message=FALSE, warning=FALSE}
+sum(is.na(returns_all))
+```
+
+Seeing as there are `r sum(is.na(returns_all))` NAs, we take a closer look at each individual symbol with missing data.
+
+```{r message=FALSE, warning=FALSE}
+colSums(is.na(returns_all))
+```
+
+Every colum has one NA, which is the first row that `Return.calculate` loses. All remaining NAs are purely due to later launch dates of `r sum(colSums(is.na(returns_all)) > 1)` ETFs, we fix this issue by setting the starting date of our time index to 2008.
+
+```{r message=FALSE, warning=FALSE}
+returns_clean <- returns_all["2008-01-01/"]
+
+sum(is.na(returns_clean))
+```
+
+## Basic Summary Statistics
+
+Before defining the parameters for the optimization, we examine some basic statistical properties of our investment universe. Since formatting a 40x40 correlation matrix is rather impractical, we select a representative subset of five asset classes to demonstrate some base statistics as well as their correlation matrix.
+
+-   **SPY:** US Equity
+-   **EFA:** Developed Markets Equities
+-   **AGG:** US Bonds
+-   **GLD:** Gold
+-   **VNQ:** Real Estate
+
+```{r message=FALSE, warning=FALSE}
+macros <- returns_clean[, c("SPY", "EFA", "AGG", "GLD", "VNQ")]
+```
+
+```{r message=FALSE, warning=FALSE}
+kable(
+  table.AnnualizedReturns(macros),
+  caption = "Annualized Performance Summary (2008-2026)"
+)
+```
+
+The Sharpe ratios are computed with a risk-free rate of zero (the default for `table.AnnualizedReturns`). Note that the optimizer maximizes quadratic utility, not the Sharpe ratio itself.
+
+
+```{r message=FALSE, warning=FALSE}
+kable(
+  table.Stats(macros),
+  caption = "Statistical Properties"
+)
+
+```
+
+For visualization purposes, we construct the correlation-matrix using monthly data.
+
+```{r message=FALSE, warning=FALSE}
+macros_monthly <- apply.monthly(macros, FUN = Return.cumulative)
+chart.Correlation(
+  macros_monthly,
+  main = "Correlation matrix of the representative sample"
+)
+```
+
+The correlation matrix reveals a few interesting patterns. Overall, all assets exhibit a positive correlation with one another with SPY, EFA and VNQ moving very closely to one another. Gold, on the other hand, is only weakly correlated with the other assets with almost no correlation whatsoever with SPY in our specified time horizon.
+
+# Strategy  
+
+We construct the portfolio using a constrained Mean-Variance optimization using monthly data with the dual objective of maximizing the expected returns while minimizing the risk subject to a defined set of constraints. The training period (IS) is set from 2008-2014 and the testing period (OOS) from the beginning of 2015 to April 2026.
+
+```{r message=FALSE, warning=FALSE}
+returns_monthly <- apply.monthly(returns_clean, FUN = Return.cumulative)
+
+# returns_IS <- returns_monthly["/2014"]
+# returns_OOS <- returns_monthly["2015/"]
+```
+
+
+## Constraints
+
+- **Base Constraints:** The portfolio is Long-Only and Fully Invested, i.e. no short-positions, that is negative weights, and no cash holdings. To prevent calculation errors we allow for a 0.1\%  floating-point buffer.  
+- **Box Constraints:** To guarantee diversification, no individual asset may exceed a 10\% portfolio weight.  
+- **Group Constraints:** A basket of 12 inflation-sensitive assets (`stagflation_assets`) consisting of metals, commodities and emerging markets is defined requiring a minimum 20\% and maximum 40\% allocation. Conversely, a basket of high-momentum tech indices (QQQ, XLK) (`speculative_assets`) is strictly capped at a maximum of 10\%.
+
+```{r message=FALSE, warning=FALSE}
+port_spec <- portfolio.spec(assets = colnames(returns_monthly))
+
+port_spec <- add.constraint(
+  portfolio = port_spec,
+  type = "weight_sum",
+  min_sum = 0.999,
+  max_sum = 1.001
+)
+
+port_spec <- add.constraint(
+  portfolio = port_spec,
+  type = "long_only"
+)
+
+port_spec <- add.constraint(
+  portfolio = port_spec,
+  type = "box",
+  min = 0,
+  max = 0.1
+)
+
+
+stagflation_assets <- c(
+  "GLD", "SLV", "DBC", "DBA", "USO", "XLE", "EEM", "FXI", "EWZ", "TIP", "GDX",
+  "XME"
+)
+
+speculative_assets <- c(
+  "QQQ", "XLK"
+)
+
+groups <- list(
+  stagflation_play = which(colnames(returns_monthly) %in% stagflation_assets),
+  speculative = which(colnames(returns_monthly) %in% speculative_assets)
+)
+
+port_spec <- add.constraint(
+  portfolio = port_spec,
+  type = "group",
+  groups = groups,
+  group_min = c(0.2, 0),
+  group_max = c(0.4, 0.1)
+)
+
+port_spec <- add.objective(
+  portfolio = port_spec,
+  type = "return",
+  name = "mean"
+)
+
+port_spec <- add.objective(
+  portfolio = port_spec,
+  type = "risk",
+  name = "StdDev"
+)
+```
+
+# Backtesting  
+
+To simulate realistic market conditions and prevent look-ahead bias, the strategy is implemented using an 84 months (7-year) rolling window optimization. This allows for a continuous adaptation to risk-estimations and changing macroeconomic regimes, as the optimizer moves forward in time. Furthermore, we define a **quarterly rebalancing** schedule as our baseline to mitigate excessive turnover, bid-ask spread costs and short-term whipsaws. We will then compare the quarterly rebalanced portfolio against its monthly and yearly rebalanced counterparts. Then we will go on to compare the performance of our portfolio against three benchmark portfolios:  
+
+- **S&P 500:** A standard buy and hold strategy in US equities.
+- **1/N**: A portfolio with equally weighted assets, rebalanced quarterly.
+- **Inverse Volatility:** A portfolio with assets weighted according to inverse volatility, estimated on a rolling 84-month window and rebalanced quarterly.
+
+
+```{r message=FALSE, warning=FALSE}
+opt_stagflation <- optimize.portfolio.rebalancing(
+  R = returns_monthly,
+  portfolio = port_spec,
+  optimize_method = "ROI",
+  rebalance_on = "quarters",
+  training_period = 84,
+  rolling_window = 84
+)
+
+weights <- extractWeights(opt_stagflation)
+
+rets_stagflation <- Return.portfolio(
+  R = returns_monthly,
+  weights = weights
+)
+
+colnames(rets_stagflation) <- "Stagflation_Strategy"
+rets_stagflation <- rets_stagflation["2015/"]
+
+kable(
+  table.AnnualizedReturns(rets_stagflation),
+  caption = "Annualized Return, StdDev and Sharpe-Ratio (2015–2026)"
+)
+```
+
+## Different Rebalancing Frequencies
+
+```{r message=FALSE, warning=FALSE}
+opt_m <- optimize.portfolio.rebalancing(
+  R = returns_monthly,
+  portfolio = port_spec,
+  optimize_method = "ROI",
+  rebalance_on = "months",
+  training_period = 84,
+  rolling_window = 84
+)
+
+weights_m <- extractWeights(opt_m)
+
+rets_m <- Return.portfolio(
+  R = returns_monthly,
+  weights = weights_m
+)
+
+colnames(rets_m) <- "Monthly_Rebalance"
+```
+
+
+```{r message=FALSE, warning=FALSE}
+opt_y <- optimize.portfolio.rebalancing(
+  R = returns_monthly,
+  portfolio = port_spec,
+  optimize_method = "ROI",
+  rebalance_on = "years",
+  training_period = 84,
+  rolling_window = 84
+)
+
+weights_y <- extractWeights(opt_y)
+
+rets_y <- Return.portfolio(
+  R = returns_monthly,
+  weights = weights_y
+)
+
+colnames(rets_y) <- "Yearly_Rebalance"
+```
+
+
+```{r message=FALSE, warning=FALSE}
+rets_q <- rets_stagflation
+
+colnames(rets_q) <- "Quarterly_Rebalance"
+```
+
+
+```{r message=FALSE, warning=FALSE}
+rebal_comparison <- na.omit(
+  cbind(
+    rets_m["2015/"],
+    rets_q["2015/"],
+    rets_y["2015/"]
+  )
+)
+
+kable(
+  table.AnnualizedReturns(rebal_comparison)
+)
+
+charts.PerformanceSummary(
+  rebal_comparison,
+  main = "Stagflation Strategy: Rebalancing Frequencies (2015-2026)"
+)
+```
+
+Analyzing the different rebalancing frequencies reveals that the yearly rebalanced portfolio strongly outperformed the other two, offering the highest absolute as well as risk-adjusted return. While monthly minimizes the absolute risk, our baseline quarterly rebalanced approach proved to be the least efficient method yielding both the lowest absolute and risk-adjusted return and absolute risk only marginally lower than in the case of yearly rebalancing.
+
+## Comparison against Benchmark Portfolios
+
+```{r message=FALSE, warning=FALSE}
+BM_SPY <- returns_monthly["2015/", "SPY"]
+colnames(BM_SPY) <- "SP_500"
+```
+
+
+```{r message=FALSE, warning=FALSE}
+equal_weights <- rep(1/ncol(returns_monthly), ncol(returns_monthly))
+
+BM_equal_weights <- Return.portfolio(
+  R = returns_monthly["2015/"],
+  weights = equal_weights,
+  rebalance_on = "quarters"
+)
+
+colnames(BM_equal_weights) <- "Equal_Weights"
+```
+
+
+```{r message=FALSE, warning=FALSE}
+sds <- rollapplyr(
+  returns_monthly,
+  width = 84,
+  FUN = sd
+)
+
+inv_vol_weights <- 1/sds/rowSums(1/sds)
+
+inv_vol_weights <- inv_vol_weights[endpoints(inv_vol_weights, on = "quarters")]
+
+BM_inv_vol <- Return.portfolio(
+  R = returns_monthly["2015/"],
+  weights = inv_vol_weights
+)
+
+colnames(BM_inv_vol) <- "Inverse_Volatility"
+```
+
+
+```{r message=FALSE, warning=FALSE}
+comparison_rets <- na.omit(
+  cbind(
+    rets_stagflation["2015/"],
+    BM_SPY,
+    BM_equal_weights,
+    BM_inv_vol
+  )
+)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+kable(
+  table.AnnualizedReturns(comparison_rets)
+)
+```
+
+The overall annualized performance reveals that the Stagflation strategy underperformed all three benchmark portfolios in terms of risk-adjusted returns, yielding the lowest Sharpe ratio. Conversely, the Inverse Volatility portfolio offered the best risk-adjusted efficiency, though it generated relatively low absolute returns. Note, however, that this portfolio is very bond-heavy, which may inflate the Sharpe ratio given the assumed risk-free rate of zero.
+
+
+
+```{r message=FALSE, warning=FALSE}
+charts.PerformanceSummary(
+  comparison_rets,
+  main = "Stagflation Strategy vs Benchmark Portfolios (2015-2026)"
+)
+```
+
+# Risk Profile  
+Now we compare and contrast our quarterly rebalanced portfolio `rets_stagflation` with the benchmark portfolios, specifically in terms of downside risk and behavior during crises.  
+
+## Downside Risk & Volatility  
+
+```{r message=FALSE, warning=FALSE}
+downside_full <- table.DownsideRisk(comparison_rets)
+
+downside_clean <- downside_full[c(
+  "Historical VaR (95%)", "Historical ES (95%)", "Maximum Drawdown"
+  ),]
+
+kable(
+  downside_clean,
+  caption = "Key Downside Risk Metrics: Stagflation Strategy vs. Benchmarks"
+)
+```
+
+The downside risk analysis of the three key metrics *Historical Value at Risk, Historical Expected Shortfall* and *Maximum Drawdown*, reveals that the Stagflation strategy only provided marginal protection over the S&P 500 (`r abs(downside_clean[3,1]) * 100`\% vs. `r abs(downside_clean[3,2]) * 100`\% Maximum Drawdown) and exhibited more tail risk (Expected Shortfall of `r abs(downside_clean[2,1]) * 100`\% vs. `r abs(downside_clean[2,2]) * 100`\%). Both the Inverse Volatility and the Equal Weights portfolios performed noticeably better across all three risk-metrics than our Stagflation Strategy.
+
+
+```{r message=FALSE, warning=FALSE}
+dd_table <-  table.Drawdowns(rets_stagflation["2015/"])
+
+kable(
+  table.Drawdowns(rets_stagflation["2015/"]),
+  caption = "Large Historical Drawdowns: Stagflation Strategy"
+)
+```
+
+The longest drawdown lasted from January 31, 2022 to February 29, 2024, a total of `r dd_table[2,5]` months. The deepest trough occurred on March 31, 2020, where the portfolio lost `r abs(dd_table[1,4]) * 100`\% of its value from its previous high.
+
+## Performance in times of crises
+
+In this section we will isolate the data from 2020 onward to evaluate the strategy's performance against the benchmarks during both the deflationary COVID-19 pandemic and the following rise in inflation.
+
+```{r}
+recent_rets <- comparison_rets["2020/"]
+```
+
+
+```{r}
+kable(
+  table.AnnualizedReturns(recent_rets),
+  caption = "Crisis Era Performance: COVID, Inflation, War (2020-2026)"
+)
+```
+
+The Stagflation Strategy was not able to beat any of the three benchmark portfolios in terms of risk-adjusted efficiency while offering only marginally lower absolute risk compared to the S&P 500.
+
+```{r}
+charts.PerformanceSummary(
+  recent_rets,
+  main = "Crisis Era Performance: COVID, Inflation, War (2020-2026)"
+)
+```
+
+
+```{r}
+downside_full <- table.DownsideRisk(recent_rets)
+
+downside_clean <- downside_full[c(
+  "Historical VaR (95%)", "Historical ES (95%)", "Maximum Drawdown"
+  ),]
+
+kable(
+  downside_clean,
+  caption = "Key Downside Risk Metrics (2020-2026)"
+)
+```
+
+Analyzing the downside risk during the crisis era confirms the strategy's limitations in terms of capital preservation relative to the benchmark portfolios. It offered negligible improvement in Maximum Drawdown compared to the S&P 500 while still exhibiting higher tail risk, as evident by comparing the Expected Shortfall of both strategies.
+
+# Limitations  
+
+## Turnover and Transaction Costs  
+An important consideration for the real-world applicability of this strategy (if practicable at all) is the portfolio turnover. While our backtest assumes a frictionless market, trading and reallocating a universe of 40 assets requires careful consideration of transaction costs including bid-ask spreads, commissions and taxes. The monthly rebalanced portfolio, for instance, might offer slightly higher returns but that comes at the cost of three times more frequent trading. A quarterly rebalancing schedule offers a pragmatic and realistic approach to reducing both turnover cost and drift.  
+
+## Sensitivity  
+A common issue with standard Mean-Variance Optimization is its high sensitivity to input parameters. The optimizer is highly sensitive to the chosen timeframe of the 84 month rolling window. While it does create a highly stable, slow moving portfolio, intentional due to our economic reasoning of a significant global regime shift, it severely lags in recognizing sudden regime shifts such as the sudden onset of the 2020 COVID crash. Shortening the rolling window would make the portfolio more reactive but also increase asset sensitivity and whipsaw risk.
+
+## Economic Intuition  
+The design of this portfolio demonstrates a structural bet against the current global market regime. While our macroeconomic intuition regarding stagflation and a pivot away from heavily US-based, speculative assets toward hard assets and emerging markets may prove true in the long run, it bears significant opportunity costs in the short-term. By forcing capital into inflation-sensitive assets during one of the biggest, largely tech-driven bull runs, we essentially set ourselves up for failure. Although the Mean-Variance optimizer worked to computationally generate the best risk-adjusted returns subject to our constraints, it could not rescue the portfolio from being fundamentally misaligned with the current global economic environment.
+
+
+# Conclusion  
+Ultimately, this paper demonstrates that a rules-based stagflation strategy, the soundness of which is certainly debatable, struggled to compete with much simpler benchmark portfolios in the current market environment. The results highlight a fundamental tension when it comes to (systematic) investing: Structural conviction can carry significant opportunity costs, especially when the regime it anticipates has yet to manifest itself. Whether a structural shift and a following *rotation* proves true in the future, remains uncertain. However, the provided framework can serve as a model that can be refined, adapted or completely reevaluated as the macroeconomic environment evolves.
+
+
+\newpage
+
+# Appendix  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+appendix_data <- data.frame(
+  Symbol = c(
+    "SPY", "QQQ", "IWM", "MDY", "XLF", "XLK", "XLV", "XLE", "XLP", "XLI", "XLB", 
+  "XLU", "XLY", "EFA", "EEM", "VGK", "EWJ", "FXI", "EWZ", "EWY", "EWG", "EWC",
+  "AGG", "TLT", "IEF", "SHY", "LQD", "HYG", "EMB", "TIP", "BIL", "GLD", "SLV", 
+  "DBC", "DBA", "USO", "XME", "GDX", "VNQ", "RWX"
+  ),
+  Description = c(
+    "S&P 500 ETF Trust",
+    "Nasdaq 100 ETF",
+    "Russell 2000 ETF", "S&P MidCap 400 ETF", 
+    "Financial Select Sector SPDR",
+    "Technology Select Sector SPDR",
+    "Health Care Select Sector SPDR", 
+    "Energy Select Sector SPDR",
+    "Consumer Staples Select Sector SPDR",
+    "Industrial Select Sector SPDR", 
+    "Materials Select Sector SPDR",
+    "Utilities Select Sector SPDR",
+    "Consumer Discretionary Select Sector SPDR",
+    "MSCI EAFE ETF (Developed Markets)",
+    "MSCI Emerging Markets ETF",
+    "FTSE Europe ETF",
+    "MSCI Japan ETF", 
+    "China Large-Cap ETF",
+    "MSCI Brazil ETF",
+    "MSCI South Korea ETF",
+    "MSCI Germany ETF",
+    "MSCI Canada ETF",
+    "U.S. Aggregate Bond ETF",
+    "20+ Year Treasury Bond ETF",
+    "7-10 Year Treasury Bond ETF",
+    "1-3 Year Treasury Bond ETF", 
+    "Investment Grade Corporate Bond ETF",
+    "High Yield Corporate Bond ETF",
+    "Emerging Markets Bond ETF", 
+    "TIPS Bond ETF",
+    "1-3 Month T-Bill ETF",
+    "Gold Trust",
+    "Silver Trust",
+    "Commodity Index Fund",
+    "Agriculture Fund",
+    "United States Oil Fund", 
+    "S&P Metals & Mining ETF",
+    "Gold Miners ETF",
+    "Vanguard Real Estate ETF",
+    "International Real Estate ETF"
+  )
+)
+
+kable(appendix_data, caption = "Description of Asset Class Symbols", booktabs = TRUE) |> 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                latex_options = "striped")
+```
+
